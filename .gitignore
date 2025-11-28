@@ -50,6 +50,8 @@ coverage.xml
 *.py,cover
 .hypothesis/
 .pytest_cache/
+# Test statistics 
+junit.xml
 
 # Translations
 *.mo
@@ -114,6 +116,9 @@ venv.bak/
 .spyderproject
 .spyproject
 
+# Pycharm project settings
+.idea
+
 # Rope project settings
 .ropeproject
 
@@ -127,3 +132,11 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# VS Code
+.vscode/
+
+# Data Files (avoid accidentally uploading data)
+*.csv
+*.xlsx
+
