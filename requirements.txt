@@ -1,5 +1,1 @@
-# Required libraries
-
-# Example
-# numpy>=1.25.0
-# pandas>=2.2.2
+pillow>=12.0.0
