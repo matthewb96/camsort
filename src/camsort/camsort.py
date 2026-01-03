@@ -300,6 +300,10 @@ def plot_images(images: list[ImageFile], output_path: pathlib.Path) -> None:
         f"{(location_mask & date_mask).sum() / len(data):.1%}",
     )
 
+    # TODO: calculate groups using sklearn clustering
+    rng = np.random.default_rng()
+    data["group"] = rng.integers(0, 10, len(data))
+
     fig = plt.figure(figsize=(15, 15))
     nrows, ncols = 2, 2
     _map_locations(
@@ -312,7 +316,9 @@ def plot_images(images: list[ImageFile], output_path: pathlib.Path) -> None:
         location_mask,
     )
     _plot_timeline(fig.add_subplot(nrows, ncols, 3), data, date_mask)
-    _plot_3d(fig.add_subplot(nrows, ncols, 4, projection="3d"), data, location_mask, date_mask)
+    _plot_3d(
+        fig.add_subplot(nrows, ncols, 4, projection="3d"), data, location_mask & date_mask
+    )
 
     fig.set_layout_engine("tight")
     output_path = output_path.with_suffix(".pdf")
@@ -320,21 +326,23 @@ def plot_images(images: list[ImageFile], output_path: pathlib.Path) -> None:
     LOG.info("Written: %s", output_path)
 
 
-def _plot_3d(
-    ax: mplot3d.Axes3D, data: pd.DataFrame, location_mask: pd.Series, date_mask: pd.Series
-) -> None:
-    ax.scatter(
-        data.loc[location_mask & date_mask, "longitude"],
-        data.loc[location_mask & date_mask, "latitude"],
-        dates.date2num(data.loc[location_mask & date_mask, "datetime"]),
+def _plot_3d(ax: mplot3d.Axes3D, data: pd.DataFrame, mask: pd.Series) -> None:
+    scatter = ax.scatter(
+        data.loc[mask, "longitude"],
+        data.loc[mask, "latitude"],
+        dates.date2num(data.loc[mask, "datetime"]),
+        c=data.loc[mask, "group"],
     )
-    ax.set_zlabel("Datetime")
-    ax.set_zticklabels([])
+    ax.legend(*scatter.legend_elements(), title="Random Clusters")
+
     ax.set_title("Images by Location and Timestamp")
+    ax.set_zlabel("Datetime")
     ax.set_xlabel("Latitude")
     ax.set_ylabel("Longitude")
+
     ax.set_xticklabels([])
     ax.set_yticklabels([])
+    ax.set_zticklabels([])
 
 
 def _map_locations(
@@ -359,7 +367,12 @@ def _map_locations(
             limits["latitude"][1] + (adjustment // 2),
         )
 
-    ax.scatter(data.loc[mask, "longitude"], data.loc[mask, "latitude"])
+    scatter = ax.scatter(
+        data.loc[mask, "longitude"],
+        data.loc[mask, "latitude"],
+        c=data.loc[mask, "group"],
+    )
+    ax.legend(*scatter.legend_elements(), title="Random Cluster")
     ax.set_axis_off()
     ax.set_aspect("equal")
     ax.set_xlim(limits["longitude"])
@@ -369,7 +382,15 @@ def _map_locations(
 
 
 def _plot_timeline(ax: axes.Axes, data: pd.DataFrame, mask: pd.Series) -> None:
-    ax.hist(dates.date2num(data.loc[mask, "datetime"]), bins=30)
+    labels = []
+    datasets = []
+    for group, group_data in data.loc[mask, :].groupby("group")["datetime"]:
+        labels.append(group)
+        datasets.append(dates.date2num(group_data.to_numpy()))
+
+    ax.hist(datasets, bins=30, histtype="barstacked", label=labels)
+    ax.legend(title="Random Cluster")
+
     ax.set_title("Images by Timestamp")
     locator = dates.YearLocator()
     ax.xaxis.set_major_locator(locator)
@@ -384,7 +405,7 @@ def main():
     logging.basicConfig(level=logging.INFO)
 
     media = find_media_files(base_folder)
-    dump_json(output_folder / "media.json", media)
+    # dump_json(output_folder / "media.json", media)
 
     plot_images(
         [i for i in itertools.chain.from_iterable(media.values()) if isinstance(i, ImageFile)],
