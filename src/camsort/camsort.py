@@ -6,6 +6,7 @@ import abc
 import collections
 import dataclasses
 import datetime
+import fractions
 import functools
 import itertools
 import json
@@ -16,6 +17,12 @@ import warnings
 from collections.abc import Collection, Mapping
 from typing import Any, Literal, NamedTuple
 
+import contextily as cx
+import numpy as np
+import pandas as pd
+from matplotlib import axes, dates
+from matplotlib import pyplot as plt
+from mpl_toolkits import mplot3d
 from PIL import ExifTags, Image
 
 ##### CONSTANTS #####
@@ -48,7 +55,7 @@ def degrees_minutes_to_decimal(
     if longitude_ref == "W":
         lon *= -1
 
-    return lat, lon
+    return float(lat), float(lon)
 
 
 class Location(NamedTuple):
@@ -163,6 +170,7 @@ class ImageFile(MediaFile):
         tags = self.load_tags()
         # Attempt to convert tags to JSON serializable types
         data["exif"] = {ExifTags.TAGS[i]: _basic_types(j) for i, j in tags.items()}
+        data["location"] = self.location._asdict()
         return data
 
     def load_tags(self) -> dict[int, _Serializable]:
@@ -176,21 +184,35 @@ class ImageFile(MediaFile):
 
         return tags
 
+    @property
+    def created_at(self) -> datetime.datetime:
+        """Created date / time for the media file."""
+        tags = self.load_tags()
+        try:
+            return datetime.datetime.strptime(
+                tags[ExifTags.Base.DateTime], "%Y:%m:%d %H:%M:%S"
+            )
+        except KeyError:
+            return datetime.datetime.fromtimestamp(self.filestats.st_mtime)
+
     @functools.cached_property
     def location(self) -> Location:
         """Image location as longitude, latitude and altitude."""
         gps = self.load_tags()[ExifTags.Base.GPSInfo]
-        latitude, longitude = degrees_minutes_to_decimal(
-            gps[ExifTags.GPS.GPSDestLatitude],
-            gps[ExifTags.GPS.GPSDestLongitude],
-            gps[ExifTags.GPS.GPSDestLatitudeRef],
-            gps[ExifTags.GPS.GPSDestLongitudeRef],
-        )
-        return Location(
-            latitude,
-            longitude,
-            gps[ExifTags.GPS.GPSAltitude],
-        )
+
+        lat = ExifTags.GPSTAGS[ExifTags.GPS.GPSLatitude]
+        lon = ExifTags.GPSTAGS[ExifTags.GPS.GPSLongitude]
+        lat_ref = ExifTags.GPSTAGS[ExifTags.GPS.GPSLatitudeRef]
+        lon_ref = ExifTags.GPSTAGS[ExifTags.GPS.GPSLongitudeRef]
+
+        try:
+            latitude, longitude = degrees_minutes_to_decimal(
+                gps[lat], gps[lon], gps[lat_ref], gps[lon_ref]
+            )
+        except KeyError:
+            latitude, longitude = np.nan, np.nan
+
+        return Location(longitude, latitude, gps.get(ExifTags.GPS.GPSAltitude, np.nan))
 
 
 def _json_encoder(
@@ -204,11 +226,14 @@ def _json_encoder(
         return obj.isoformat()
     if isinstance(obj, bytes):
         return obj.decode()
+    if isinstance(obj, fractions.Fraction):
+        return str(obj)
     raise TypeError(f"{type(obj)} not JSON serializable")
 
 
 def dump_json(path: pathlib.Path, obj: object) -> None:
     """Dump `obj` to JSON file."""
+    LOG.info("Writing JSON")
     with path.open("w", encoding="utf-8") as file:
         json.dump(obj, file, indent=4, default=_json_encoder)
     LOG.info("Written: %s", path)
@@ -216,8 +241,11 @@ def dump_json(path: pathlib.Path, obj: object) -> None:
 
 def find_media_files(base_folder: pathlib.Path) -> dict[str, list[MediaFile]]:
     """Find images and videos in `base_folder` and sub-folders."""
+    LOG.info("Finding media within %s", base_folder)
     media_files: dict[str, list[MediaFile]] = collections.defaultdict(list)
 
+    count = 0
+    count_other = 0
     for folder, _, filenames in base_folder.walk():
         for name in filenames:
             path = folder / name
@@ -226,6 +254,7 @@ def find_media_files(base_folder: pathlib.Path) -> dict[str, list[MediaFile]]:
             elif path.suffix.lower() in _VIDEO_SUFFIXES:
                 media_class = MediaFile
             else:
+                count_other += 1
                 continue
 
             extras = [i for i in filenames if i.startswith(name) and i != name]
@@ -233,18 +262,134 @@ def find_media_files(base_folder: pathlib.Path) -> dict[str, list[MediaFile]]:
                 media = media_class(path)
             else:
                 media = media_class(path, extras=extras)
-            media_files[name].append(media)
 
+            media_files[name].append(media)
+            count += 1
+
+    LOG.info(
+        "Finished searching: %s media files found and %s others",
+        f"{count:,}",
+        f"{count_other:,}",
+    )
     return dict(media_files)
 
 
+def plot_images(images: list[ImageFile], output_path: pathlib.Path) -> None:
+    """Plot image locations and dates."""
+    data = pd.DataFrame(
+        [
+            (i.path.stem, i.location.latitude, i.location.longitude, i.created_at)
+            for i in images
+        ],
+        columns=["name", "latitude", "longitude", "datetime"],
+    )
+    output_path = output_path.with_suffix(".csv")
+    data.to_csv(output_path, index=False)
+    LOG.info("Written: %s", output_path)
+
+    location_mask = ~data[["latitude", "longitude"]].isna().any(axis=1)
+    date_mask = ~data["datetime"].isna()
+
+    LOG.info(
+        "%s (%s) have location, %s (%s) have a timestamp and %s (%s) have both",
+        f"{location_mask.sum():,}",
+        f"{location_mask.sum() / len(data):.1%}",
+        f"{date_mask.sum():,}",
+        f"{date_mask.sum() / len(data):.1%}",
+        f"{(location_mask & date_mask).sum():,}",
+        f"{(location_mask & date_mask).sum() / len(data):.1%}",
+    )
+
+    fig = plt.figure(figsize=(15, 15))
+    nrows, ncols = 2, 2
+    _map_locations(
+        fig.add_subplot(
+            nrows,
+            ncols,
+            (1, 2),
+        ),
+        data,
+        location_mask,
+    )
+    _plot_timeline(fig.add_subplot(nrows, ncols, 3), data, date_mask)
+    _plot_3d(fig.add_subplot(nrows, ncols, 4, projection="3d"), data, location_mask, date_mask)
+
+    fig.set_layout_engine("tight")
+    output_path = output_path.with_suffix(".pdf")
+    fig.savefig(output_path)
+    LOG.info("Written: %s", output_path)
+
+
+def _plot_3d(
+    ax: mplot3d.Axes3D, data: pd.DataFrame, location_mask: pd.Series, date_mask: pd.Series
+) -> None:
+    ax.scatter(
+        data.loc[location_mask & date_mask, "longitude"],
+        data.loc[location_mask & date_mask, "latitude"],
+        dates.date2num(data.loc[location_mask & date_mask, "datetime"]),
+    )
+    ax.set_zlabel("Datetime")
+    ax.set_zticklabels([])
+    ax.set_title("Images by Location and Timestamp")
+    ax.set_xlabel("Latitude")
+    ax.set_ylabel("Longitude")
+    ax.set_xticklabels([])
+    ax.set_yticklabels([])
+
+
+def _map_locations(
+    ax: axes.Axes, data: pd.DataFrame, mask: pd.Series, margin: float = 0.2
+) -> None:
+    limits = {}
+    for col in ("longitude", "latitude"):
+        min_ = data.loc[mask, col].min()
+        max_ = data.loc[mask, col].max()
+
+        diff = abs(max_ - min_)
+        limits[col] = (min_ - (diff * margin), max_ + (diff * margin))
+
+    # Make Y min diff at least 60% of x min diff so the graph fills more space
+    ratio = 0.6
+    y_diff = abs(limits["latitude"][1] - limits["latitude"][0])
+    x_diff = abs(limits["longitude"][1] - limits["longitude"][0])
+    if y_diff < (ratio * x_diff):
+        adjustment = (ratio * x_diff) - y_diff
+        limits["latitude"] = (
+            limits["latitude"][0] - (adjustment // 2),
+            limits["latitude"][1] + (adjustment // 2),
+        )
+
+    ax.scatter(data.loc[mask, "longitude"], data.loc[mask, "latitude"])
+    ax.set_axis_off()
+    ax.set_aspect("equal")
+    ax.set_xlim(limits["longitude"])
+    ax.set_ylim(limits["latitude"])
+    cx.add_basemap(ax, source=cx.providers.OpenStreetMap.Mapnik, crs="EPSG:4326")
+    ax.set_title("Map of Image Locations")
+
+
+def _plot_timeline(ax: axes.Axes, data: pd.DataFrame, mask: pd.Series) -> None:
+    ax.hist(dates.date2num(data.loc[mask, "datetime"]), bins=30)
+    ax.set_title("Images by Timestamp")
+    locator = dates.YearLocator()
+    ax.xaxis.set_major_locator(locator)
+    ax.xaxis.set_major_formatter(dates.AutoDateFormatter(locator))
+    ax.xaxis.set_tick_params("major", rotation=45)
+
+
 def main():
-    base_folder = pathlib.Path()
+    base_folder = pathlib.Path("data/images")
+    output_folder = base_folder.parent / "camsort-outputs"
+    output_folder.mkdir(exist_ok=True)
     logging.basicConfig(level=logging.INFO)
 
     media = find_media_files(base_folder)
+    dump_json(output_folder / "media.json", media)
 
-    dump_json(pathlib.Path("media.json"), media)
+    plot_images(
+        [i for i in itertools.chain.from_iterable(media.values()) if isinstance(i, ImageFile)],
+        output_folder / "image_locations",
+    )
 
     found_paths = list(
         itertools.chain.from_iterable(
@@ -261,7 +406,7 @@ def main():
             if path not in found_paths:
                 others[path.suffix].append(path)
 
-    dump_json(pathlib.Path("others.json"), others)
+    dump_json(output_folder / "others.json", others)
 
 
 if __name__ == "__main__":
